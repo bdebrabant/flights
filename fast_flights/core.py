@@ -19,17 +19,40 @@ DataSource = Literal['html', 'js']
 # These are used only if the caller does not supply cookies (binary) and
 # does not provide cookies via request_kwargs.
 _DEFAULT_COOKIES = {
-    "CONSENT": "PENDING+987",
+    "CONSENT": "YES+cb.20210720-07-p0.en+FX+410",
     "SOCS": "CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmRlIAEaBgiAo_CmBg",
 }
 _DEFAULT_COOKIES_BYTES = json.dumps(_DEFAULT_COOKIES).encode("utf-8")
 
 
 def fetch(params: dict, request_kwargs: dict | None = None) -> Response:
-    client = Client(impersonate="chrome_126", verify=False)
-    # Pass through any extra request kwargs (e.g., cookies, headers)
     req_kwargs = request_kwargs.copy() if request_kwargs else {}
-    res = client.get("https://www.google.com/travel/flights", params=params, **req_kwargs)
+    # proxy is a Client constructor param, not a get() param — extract it
+    proxy = req_kwargs.pop('proxy', None)
+    # _trace_writer is optional — pop before passing to HTTP client
+    _tw = req_kwargs.pop('_trace_writer', None)
+
+    base_url = "https://www.google.com/travel/flights"
+    from urllib.parse import urlencode
+    full_url = f"{base_url}?{urlencode(params)}"
+
+    import datetime as _dt
+    if _tw:
+        _tw.write(
+            f"\n  >> HTTP GET {full_url}\n"
+            f"     Proxy  : {proxy or 'none'}\n"
+        )
+
+    client = Client(impersonate="chrome_126", verify=False, proxy=proxy)
+    res = client.get(base_url, params=params, **req_kwargs)
+
+    if _tw:
+        body_preview = (res.text or '')[:300].replace('\n', ' ')
+        _tw.write(
+            f"     Status : {res.status_code}   Size : {len(res.text or '')} chars\n"
+            f"     Body   : {body_preview}{'…' if len(res.text or '') > 300 else ''}\n"
+        )
+
     assert res.status_code == 200, f"{res.status_code} Result: {res.text_markdown}"
     return res
 
@@ -244,24 +267,34 @@ def parse_response(
                 strip=True
             )
 
-            # Get departure & arrival time
+            # Get departure & arrival time (outbound [0],[1]; return leg [2],[3] for round trips)
             dp_ar_node = item.css("span.mv1WYe div")
             try:
                 departure_time = dp_ar_node[0].text(strip=True)
                 arrival_time = dp_ar_node[1].text(strip=True)
             except IndexError:
-                # sometimes this is not present
                 departure_time = ""
                 arrival_time = ""
+            return_departure_time = dp_ar_node[2].text(strip=True) if len(dp_ar_node) > 2 else ""
+            return_arrival_time = dp_ar_node[3].text(strip=True) if len(dp_ar_node) > 3 else ""
 
             # Get arrival time ahead
             time_ahead = safe(item.css_first("span.bOzv6")).text()
 
-            # Get duration
-            duration = safe(item.css_first("li div.Ak5kof div")).text()
+            # Get duration (outbound first, return second for round trips if present)
+            def _is_duration(s):
+                return bool(s and re.search(r'\d+\s*(hr|min|h|m)\b', s, re.I))
 
-            # Get flight stops
-            stops = safe(item.css_first(".BbR8Ec .ogfYpf")).text()
+            duration_nodes = item.css("li div.Ak5kof div")
+            duration = duration_nodes[0].text(strip=True) if duration_nodes else ""
+            _rd = duration_nodes[1].text(strip=True) if len(duration_nodes) > 1 else ""
+            return_duration = _rd if _is_duration(_rd) else ""
+
+            # Get flight stops (outbound first, return second for round trips if present)
+            stops_nodes = item.css(".BbR8Ec .ogfYpf")
+            stops = stops_nodes[0].text(strip=True) if stops_nodes else ""
+            _rs = stops_nodes[1].text(strip=True) if len(stops_nodes) > 1 else ""
+            return_stops_raw = _rs if (_rs == "Nonstop" or re.match(r'^\d+', _rs or '')) else ""
 
             # Get delay
             delay = safe(item.css_first(".GsCCve")).text() or None
@@ -270,10 +303,11 @@ def parse_response(
             price = safe(item.css_first(".YMlIz.FpEdX")).text() or "0"
 
             # Stops formatting
-            try:
-                stops_fmt = 0 if stops == "Nonstop" else int(stops.split(" ", 1)[0])
-            except ValueError:
-                stops_fmt = "Unknown"
+            def _parse_stops(s):
+                try:
+                    return 0 if s == "Nonstop" else int(s.split(" ", 1)[0])
+                except (ValueError, AttributeError):
+                    return 0
 
             flights.append(
                 {
@@ -283,14 +317,35 @@ def parse_response(
                     "arrival": " ".join(arrival_time.split()),
                     "arrival_time_ahead": time_ahead,
                     "duration": duration,
-                    "stops": stops_fmt,
+                    "stops": _parse_stops(stops),
                     "delay": delay,
                     "price": price.replace(",", ""),
+                    "return_departure": " ".join(return_departure_time.split()),
+                    "return_arrival": " ".join(return_arrival_time.split()),
+                    "return_duration": return_duration,
+                    "return_stops": _parse_stops(return_stops_raw),
                 }
             )
 
     current_price = safe(parser.css_first("span.gOatQ")).text()
     if not flights:
+        # HTML mode found no flights. Check if this is a valid Google Flights page
+        # (has ds:1 script) — if so, try JS mode as a fallback before giving up.
+        # This handles cases where Google serves the page without pre-rendered HTML
+        # divs but the ds:1 script still contains embedded flight data.
+        ds1_el = parser.css_first(r'script.ds\:1')
+        if ds1_el:
+            try:
+                js_result = parse_response(r, 'js')
+                if js_result is not None:
+                    return js_result
+            except Exception:
+                pass
+            # ds:1 present but no data in either mode — genuine no results
+            title_el = parser.css_first('title')
+            title_text = title_el.text() if title_el else ''
+            if 'Google Flights' in title_text:
+                raise RuntimeError("No results for this route")
         raise RuntimeError("No flights found:\n{}".format(r.text_markdown))
 
     return Result(current_price=current_price, flights=[Flight(**fl) for fl in flights])  # type: ignore
